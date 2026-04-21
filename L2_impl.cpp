@@ -124,8 +124,11 @@ void L2_impl::ether_output(std::shared_ptr<std::vector<byte>> &m, std::vector<by
 		it = m->begin(); /* Re-assign iterator invalidated by resize */
 	}
 
-	/* Virtual cable: deliver directly to the peer's ether_input (bypasses pcap).
-	 * If no peer is set, use lestart to send via pcap as normal. */
+	/* Always send via L1/NIC so Wireshark can capture the frame */
+	inet.nic()->lestart(m, it);
+
+	/* Virtual cable: also deliver directly to the peer's ether_input.
+	 * This ensures reliable delivery even when pcap loopback doesn't work. */
 	L2_impl* peer = get_peer(this);
 	if (peer) {
 		/* Make a copy of the frame for the peer */
@@ -142,9 +145,5 @@ void L2_impl::ether_output(std::shared_ptr<std::vector<byte>> &m, std::vector<by
 		it_copy += sizeof(L2::ether_header);
 
 		peer->ether_input(m_copy, it_copy, eh_copy);
-	}
-	else {
-		/* No virtual cable — send via physical NIC */
-		inet.nic()->lestart(m, it);
 	}
 }
