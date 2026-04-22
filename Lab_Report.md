@@ -21,8 +21,9 @@
 **Functionality**:
 1. Reads the `ether_type` field from the Ethernet header. The framework's `leread` function already converts this field from network byte order to host byte order, so no `ntohs()` call is needed.
 2. **Self-loop prevention**: If the source MAC address matches our NIC's MAC address, the frame is silently dropped. This prevents processing of frames reflected back by the pcap sniffer.
-3. **Demultiplexing** based on the EtherType field:
-   - `ETHERTYPE_IP` (0x0800): Passes the packet up to Layer 3 by looking up the IP protocol handler via `inet.inetsw(SWPROTO_IP)` and calling `pr_input`.
+3. **Destination MAC filter**: If the destination MAC does not match our NIC's MAC and is not the broadcast address (`ff:ff:ff:ff:ff:ff`), the frame is dropped. This prevents cross-contamination when multiple virtual NIC pairs share the same physical pcap adapter.
+4. **Demultiplexing** based on the EtherType field:
+   - `ETHERTYPE_IP` (0x0800): Passes the packet up to Layer 3 by looking up the IP protocol handler via `inet.inetsw(SWPROTO_IP)` and calling `pr_input`. Console diagnostics are printed only for IP frames.
    - `ETHERTYPE_ARP` (0x0806): Passes the packet to the ARP module via `inet.arp()->in_arpinput()`.
    - Default: Drops the packet silently.
 
@@ -34,10 +35,14 @@ void L2_impl::ether_input(shared_ptr<vector<byte>> &m, vector<byte>::iterator &i
     // Self-loop prevention: drop our own reflected frames
     if (eh->ether_shost == inet.nic()->mac()) return;
     
+    // Destination MAC filter: only accept frames for us or broadcast
+    static const mac_addr broadcast_mac("ff:ff:ff:ff:ff:ff");
+    if (eh->ether_dhost != inet.nic()->mac() && eh->ether_dhost != broadcast_mac) return;
+    
     switch (ether_type) {
-    case ETHERTYPE_IP:  // 0x0800 → pass to L3 (pr_input)
+    case ETHERTYPE_IP:  // 0x0800 → print diagnostic, pass to L3 (pr_input)
     case ETHERTYPE_ARP: // 0x0806 → pass to ARP module
-    default:            // drop unknown types
+    default:            // drop unknown types silently
     }
 }
 ```
@@ -95,13 +100,13 @@ void L2_impl::ether_output(shared_ptr<vector<byte>> &m, vector<byte>::iterator &
 
 **Return Value**: `void`
 
-**Functionality — Validation Chain**:
-1. **IP Version**: Checks that `ip_v_hl.hb == 4` (must be IPv4). Drops otherwise.
-2. **Header Length**: Computes `hlen = ip_v_hl.lb << 2` (IHL field × 4). Must be ≥ 20 bytes (`sizeof(iphdr)`). Drops otherwise.
-3. **Total Length**: Checks that `ntohs(ip_len) >= hlen`. Drops otherwise.
-4. **Checksum**: Calls `in_cksum()` over the IP header bytes. Result must be 0. Drops otherwise.
-5. **Protocol**: Checks that `ip_p == IPPROTO_ICMP` (1). Drops non-ICMP traffic (TCP=6, UDP=17, etc.).
-6. **Destination IP**: Checks that `ip_dst.s_addr` matches our NIC's IP address or the broadcast address `0xFFFFFFFF`. Drops otherwise.
+**Functionality — Validation Chain** (all non-ICMP traffic is silently dropped without any console output):
+1. **IP Version**: Checks that `ip_v_hl.hb == 4` (must be IPv4). Silently drops otherwise.
+2. **Header Length**: Computes `hlen = ip_v_hl.lb << 2` (IHL field × 4). Must be ≥ 20 bytes (`sizeof(iphdr)`). Silently drops otherwise.
+3. **Total Length**: Checks that `ntohs(ip_len) >= hlen`. Silently drops otherwise.
+4. **Checksum**: Calls `in_cksum()` over the IP header bytes. Result must be 0. Silently drops otherwise.
+5. **Protocol**: Checks that `ip_p == IPPROTO_ICMP` (1). Silently drops non-ICMP traffic (TCP=6, UDP=17, etc.). **Console diagnostics are only printed from this point onward**, ensuring that real Wi-Fi noise does not pollute the output.
+6. **Destination IP**: Checks that `ip_dst.s_addr` matches our NIC's IP address or the broadcast address `0xFFFFFFFF`. Drops otherwise (this drop IS logged since it may indicate a configuration issue).
 
 If all validations pass:
 - Advances the iterator past the IP header (`it += hlen`)
@@ -114,15 +119,19 @@ If all validations pass:
 void L3_impl::pr_input(const struct pr_input_args &args) {
     struct iphdr* ip = reinterpret_cast<struct iphdr*>(&(*it));
     
-    if (ip->ip_v_hl.hb != 4) return;           // version check
-    hlen = ip->ip_v_hl.lb << 2;
-    if (hlen < sizeof(iphdr)) return;           // header length check
-    if (ntohs(ip->ip_len) < hlen) return;       // total length check
-    if (in_cksum(&(*it), hlen) != 0) return;    // checksum check
-    if (ip->ip_p != IPPROTO_ICMP) return;       // protocol check
-    if (ip->ip_dst.s_addr != our_ip) return;    // destination check
+    // Steps 1–5: silently drop non-ICMP / invalid packets
+    if (ip->ip_v_hl.hb != 4) return;
+    if (hlen < sizeof(iphdr)) return;
+    if (ntohs(ip->ip_len) < hlen) return;
+    if (in_cksum(&(*it), hlen) != 0) return;
+    if (ip->ip_p != IPPROTO_ICMP) return;
     
-    it += hlen;  // advance past IP header
+    // Only ICMP packets reach here — print diagnostics
+    cout << "[L3] <-- pr_input captured frame!" << endl;
+    // Step 6: destination IP check (logged)
+    if (ip->ip_dst.s_addr != our_ip) return;
+    
+    it += hlen;
     inet.getICMP()->recvFromL4(sendData, sendDataLen, destIP);
 }
 ```
@@ -241,12 +250,12 @@ int L3_impl::ip_output(const struct ip_output_args &args) {
 
 We implemented a "virtual cable" mechanism that enables direct in-memory communication between two virtual NIC instances. This was necessary because Windows Wi-Fi adapters do not support pcap loopback — frames injected via `pcap_sendpacket` are not captured back by the sniffer on the same adapter.
 
-**Global Variables**:
-- `g_peer_a`, `g_peer_b` — Pointers to the two connected `L2_impl` instances
+**Global Data Structure**:
+- `g_peer_map` — A `std::map<L2_impl*, L2_impl*>` that maps each L2_impl to its peer. This supports **multiple independent virtual cable pairs** simultaneously (e.g., one pair for the external topology and another for the internal topology).
 
 **Functions**:
-- `L2_impl_set_peers(a, b)` — Links two peers together
-- `get_peer(self)` — Returns the peer of a given instance
+- `L2_impl_set_peers(a, b)` — Registers a bidirectional link: `map[a]=b` and `map[b]=a`
+- `get_peer(self)` — Looks up the peer of a given instance in the map
 
 **How it works**: When `ether_output` sends a frame, it:
 1. Calls `lestart()` to inject the frame via pcap (for Wireshark visibility)
@@ -257,15 +266,33 @@ We implemented a "virtual cable" mechanism that enables direct in-memory communi
 
 ### 2.3 Main Module
 
-The `main.cpp` defines three test scenarios selectable via an interactive menu:
+The `main.cpp` creates **two persistent network topologies** at startup, each with its own pair of `inet_os` instances, NICs, L2/L3/L4 stacks, ARP tables, and virtual cable connection. All objects live on `main`'s stack for the entire program lifetime — they are never destroyed between scenario runs. This avoids access violations caused by pcap sniffer threads referencing destroyed objects.
 
-| Scenario | Client | Server | Routing | Purpose |
-|----------|--------|--------|---------|---------|
-| **A** | 10.0.0.15/24 (gw: 10.0.0.1) | 20.0.0.10/24 (gw: 20.0.0.1) | External (via gateway) | Send ICMP to IP outside our subnet |
-| **B** | 10.0.0.15/24 | 10.0.0.10/24 | Internal (direct) | Send ICMP to IP inside our subnet |
-| **C** | 10.0.0.15/24 (receives) | 10.0.0.10/24 (sends) | Internal (direct) | Receive ICMP and send reply |
+An interactive menu loop allows the user to select and run scenarios repeatedly without restarting.
 
-Each scenario initializes two `inet_os` instances with complete L2/L3/L4 stacks, pre-populated ARP tables (static entries), and a virtual cable connection.
+**Topology A (External):**
+
+| Role | IP | MAC | Gateway |
+|------|----|-----|----------|
+| Client | 10.0.0.15/24 | `b1:b1:b1:b1:b1:b1` | 10.0.0.1 |
+| Server | 20.0.0.10/24 | `a1:a1:a1:a1:a1:a1` | 20.0.0.1 |
+
+**Topology B/C (Internal):**
+
+| Role | IP | MAC | Gateway |
+|------|----|-----|----------|
+| Client | 10.0.0.25/24 | `b2:b2:b2:b2:b2:b2` | none |
+| Server | 10.0.0.20/24 | `a2:a2:a2:a2:a2:a2` | none |
+
+**Scenarios:**
+
+| Scenario | Topology | Sender → Receiver | Routing | Purpose |
+|----------|----------|-------------------|---------|---------|
+| **A** | External | Client 10.0.0.15 → Server 20.0.0.10 | Via gateway | Send ICMP to IP outside our subnet |
+| **B** | Internal | Client 10.0.0.25 → Server 10.0.0.20 | Direct | Send ICMP to IP inside our subnet |
+| **C** | Internal | Server 10.0.0.20 → Client 10.0.0.25 | Direct | Receive ICMP and send reply |
+
+Each topology uses unique MAC addresses to prevent cross-contamination via the destination MAC filter in `ether_input`.
 
 ### 2.4 Byte Order Convention
 
@@ -283,7 +310,7 @@ Each scenario initializes two `inet_os` instances with complete L2/L3/L4 stacks,
 
 ### 3.1 Example A — ICMP REQUEST to IP Address NOT in Our Subnet (External Ping)
 
-**Configuration**: Client `10.0.0.15/24` (gateway: `10.0.0.1`) → Server `20.0.0.10/24` (gateway: `20.0.0.1`)
+**Configuration**: Client `10.0.0.15/24` (MAC `b1:b1:b1:b1:b1:b1`, gateway: `10.0.0.1`) → Server `20.0.0.10/24` (MAC `a1:a1:a1:a1:a1:a1`, gateway: `20.0.0.1`)
 
 **📸 [INSERT SCREENSHOT: Console output for Scenario A — showing "External target -> routing via gateway"]**
 
@@ -292,20 +319,20 @@ Each scenario initializes two `inet_os` instances with complete L2/L3/L4 stacks,
 **Detailed Packet Flow Analysis**:
 
 **Sending the ECHO REQUEST**:
-1. `main` calls `ICMP_client.sendToL4("NetlabPingPongTest", "20.0.0.10", ECHO_REQUEST)`
+1. `main` calls `ext_cli_icmp.sendToL4("NetlabPingPongTest", "20.0.0.10", ECHO_REQUEST)`
 2. **L4 (sendToL4)**: Builds an ICMP ECHO_REQUEST using libtins, serializes it, allocates a full buffer (14 + 20 + ICMP bytes), copies the ICMP payload after the L2/L3 header space, sets up the route with destination 20.0.0.10, and calls `pr_output`.
 3. **L3 (ip_output)**: Fills the IP header — src=10.0.0.15, dst=20.0.0.10, protocol=ICMP, TTL=64. Computes the IP header checksum. **Routing check**: `(20.0.0.10 & 255.255.255.0) = 20.0.0.0` ≠ `(10.0.0.15 & 255.255.255.0) = 10.0.0.0` → **External target!** Overwrites the L2 next-hop to gateway `10.0.0.1`. Calls `ether_output`.
-4. **L2 (ether_output)**: Address family is `AF_INET` → ARP resolves 10.0.0.1 → returns MAC `aa:aa:aa:aa:aa:aa` (static entry). Builds the Ethernet header (dst=aa:aa:aa:aa:aa:aa, src=bb:bb:bb:bb:bb:bb, type=0x0800). Pads to 60 bytes. Sends via `lestart` and virtual cable.
+4. **L2 (ether_output)**: Address family is `AF_INET` → ARP resolves 10.0.0.1 → returns MAC `a1:a1:a1:a1:a1:a1` (static entry). Builds the Ethernet header (dst=a1:a1:a1:a1:a1:a1, src=b1:b1:b1:b1:b1:b1, type=0x0800). Pads to 60 bytes. Sends via `lestart` and virtual cable.
 
 **Reception and Reply by Server (ECHO REPLY)**:
-5. **L2 Server (ether_input)**: Receives the frame via virtual cable. ether_type=0x0800 (IP) → passes to L3.
+5. **L2 Server (ether_input)**: Receives the frame via virtual cable. Destination MAC `a1:a1:a1:a1:a1:a1` matches server's MAC ✓. ether_type=0x0800 (IP) → passes to L3.
 6. **L3 Server (pr_input)**: Validation chain: version=4 ✓, hlen=20 ✓, checksum ✓, protocol=ICMP ✓, dst=20.0.0.10 == our_ip=20.0.0.10 ✓ → **ACCEPTED**.
 7. **L4 Server (recvFromL4)**: Parses ICMP — type=ECHO_REQUEST → automatically sends ECHO_REPLY back to 10.0.0.15 via `sendToL4`.
 8. **L3 Server (ip_output)**: src=20.0.0.10, dst=10.0.0.15. Routing: `10.0.0.15` not in `20.0.0.0/24` → **External** → next-hop = gateway 20.0.0.1.
-9. **L2 Server (ether_output)**: ARP resolves 20.0.0.1 → `bb:bb:bb:bb:bb:bb`. Sends via virtual cable.
+9. **L2 Server (ether_output)**: ARP resolves 20.0.0.1 → `b1:b1:b1:b1:b1:b1`. Sends via virtual cable.
 
 **Reception of Reply by Client**:
-10. **L2 Client (ether_input)**: ether_type=0x0800 → L3.
+10. **L2 Client (ether_input)**: Destination MAC matches ✓. ether_type=0x0800 → L3.
 11. **L3 Client (pr_input)**: dst=10.0.0.15 == our_ip ✓ → **ACCEPTED**.
 12. **L4 Client (recvFromL4)**: type=ECHO_REPLY → stores in buffer, unlocks mutex ← **Ping succeeded!**
 
@@ -313,52 +340,52 @@ Each scenario initializes two `inet_os` instances with complete L2/L3/L4 stacks,
 
 ### 3.2 Example B — ICMP REQUEST to IP Address IN Our Subnet (Internal Ping)
 
-**Configuration**: Client `10.0.0.15/24` → Server `10.0.0.10/24` (same subnet, no gateway needed)
+**Configuration**: Client `10.0.0.25/24` (MAC `b2:b2:b2:b2:b2:b2`) → Server `10.0.0.20/24` (MAC `a2:a2:a2:a2:a2:a2`) — same subnet, no gateway needed
 
 **📸 [INSERT SCREENSHOT: Console output for Scenario B — showing "Internal target -> direct routing"]**
 
-**📸 [INSERT SCREENSHOT: Wireshark capture for Scenario B — showing ICMP request 10.0.0.15 → 10.0.0.10 and reply]**
+**📸 [INSERT SCREENSHOT: Wireshark capture for Scenario B — showing ICMP request 10.0.0.25 → 10.0.0.20 and reply]**
 
 **Detailed Packet Flow Analysis**:
 
 **Sending the ECHO REQUEST**:
-1. `main` calls `ICMP_client.sendToL4("NetlabPingPongTest", "10.0.0.10", ECHO_REQUEST)`
-2. **L4 (sendToL4)**: Same as Example A — builds ICMP, allocates buffer, sets route to 10.0.0.10.
-3. **L3 (ip_output)**: Fills IP header — src=10.0.0.15, dst=10.0.0.10. **Routing check**: `(10.0.0.10 & 255.255.255.0) = 10.0.0.0` == `(10.0.0.15 & 255.255.255.0) = 10.0.0.0` → **Internal target!** The L2 next-hop remains `10.0.0.10` (no gateway redirection). Calls `ether_output`.
-4. **L2 (ether_output)**: ARP resolves `10.0.0.10` directly → MAC `aa:aa:aa:aa:aa:aa`. Sends.
+1. `main` calls `int_cli_icmp.sendToL4("NetlabPingPongTest", "10.0.0.20", ECHO_REQUEST)`
+2. **L4 (sendToL4)**: Same as Example A — builds ICMP, allocates buffer, sets route to 10.0.0.20.
+3. **L3 (ip_output)**: Fills IP header — src=10.0.0.25, dst=10.0.0.20. **Routing check**: `(10.0.0.20 & 255.255.255.0) = 10.0.0.0` == `(10.0.0.25 & 255.255.255.0) = 10.0.0.0` → **Internal target!** The L2 next-hop remains `10.0.0.20` (no gateway redirection). Calls `ether_output`.
+4. **L2 (ether_output)**: ARP resolves `10.0.0.20` directly → MAC `a2:a2:a2:a2:a2:a2`. Sends.
 
 **Reception and Reply**: Steps 5–12 are identical to Example A, except the Server's reply routing is also **Internal** (both are in `10.0.0.0/24`).
 
-**Key Difference from Example A**: In L3's routing logic, the destination `10.0.0.10` is in the same `/24` subnet as the client `10.0.0.15`. Therefore, ARP resolution is performed on the destination IP directly, not on the gateway address. The console output shows `"Internal target -> direct routing"` instead of `"External target -> routing via gateway"`.
+**Key Difference from Example A**: In L3's routing logic, the destination `10.0.0.20` is in the same `/24` subnet as the client `10.0.0.25`. Therefore, ARP resolution is performed on the destination IP directly, not on the gateway address. The console output shows `"Internal target -> direct routing"` instead of `"External target -> routing via gateway"`.
 
 ---
 
 ### 3.3 Example C — Receive ICMP REQUEST from IP in Our Subnet and Send Reply
 
-**Configuration**: Server `10.0.0.10/24` sends ping → Client `10.0.0.15/24` receives and auto-replies
+**Configuration**: Server `10.0.0.20/24` (MAC `a2:a2:a2:a2:a2:a2`) sends ping → Client `10.0.0.25/24` (MAC `b2:b2:b2:b2:b2:b2`) receives and auto-replies
 
 **📸 [INSERT SCREENSHOT: Console output for Scenario C — showing Server sends ECHO_REQUEST, Client receives and sends ECHO_REPLY]**
 
-**📸 [INSERT SCREENSHOT: Wireshark capture for Scenario C — showing ICMP request 10.0.0.10 → 10.0.0.15 and reply 10.0.0.15 → 10.0.0.10]**
+**📸 [INSERT SCREENSHOT: Wireshark capture for Scenario C — showing ICMP request 10.0.0.20 → 10.0.0.25 and reply 10.0.0.25 → 10.0.0.20]**
 
 **Detailed Packet Flow Analysis**:
 
 **Server Sends ECHO REQUEST**:
-1. `main` calls `ICMP_server.sendToL4("NetlabPingPongTest", "10.0.0.15", ECHO_REQUEST)`
-2. **L4 Server (sendToL4)**: Builds ICMP ECHO_REQUEST, sets route to 10.0.0.15.
-3. **L3 Server (ip_output)**: src=10.0.0.10, dst=10.0.0.15. Internal routing (same subnet).
-4. **L2 Server (ether_output)**: ARP resolves 10.0.0.15 → `bb:bb:bb:bb:bb:bb`. Sends via virtual cable.
+1. `main` calls `int_srv_icmp.sendToL4("NetlabPingPongTest", "10.0.0.25", ECHO_REQUEST)`
+2. **L4 Server (sendToL4)**: Builds ICMP ECHO_REQUEST, sets route to 10.0.0.25.
+3. **L3 Server (ip_output)**: src=10.0.0.20, dst=10.0.0.25. Internal routing (same subnet).
+4. **L2 Server (ether_output)**: ARP resolves 10.0.0.25 → `b2:b2:b2:b2:b2:b2`. Sends via virtual cable.
 
 **Client Receives and Auto-Replies**:
-5. **L2 Client (ether_input)**: ether_type=0x0800 → passes to L3.
-6. **L3 Client (pr_input)**: version=4 ✓, hlen=20 ✓, checksum ✓, protocol=ICMP ✓, dst=10.0.0.15 == our_ip ✓ → **ACCEPTED**.
-7. **L4 Client (recvFromL4)**: type=ECHO_REQUEST → **Automatically sends ECHO_REPLY** back to 10.0.0.10 via `sendToL4`.
-8. **L3 Client (ip_output)**: src=10.0.0.15, dst=10.0.0.10. Internal routing.
-9. **L2 Client (ether_output)**: ARP resolves 10.0.0.10 → `aa:aa:aa:aa:aa:aa`. Sends.
+5. **L2 Client (ether_input)**: Destination MAC `b2:b2:b2:b2:b2:b2` matches ✓. ether_type=0x0800 → passes to L3.
+6. **L3 Client (pr_input)**: version=4 ✓, hlen=20 ✓, checksum ✓, protocol=ICMP ✓, dst=10.0.0.25 == our_ip ✓ → **ACCEPTED**.
+7. **L4 Client (recvFromL4)**: type=ECHO_REQUEST → **Automatically sends ECHO_REPLY** back to 10.0.0.20 via `sendToL4`.
+8. **L3 Client (ip_output)**: src=10.0.0.25, dst=10.0.0.20. Internal routing.
+9. **L2 Client (ether_output)**: ARP resolves 10.0.0.20 → `a2:a2:a2:a2:a2:a2`. Sends.
 
 **Server Receives the Reply**:
-10. **L2 Server (ether_input)**: ether_type=0x0800 → L3.
-11. **L3 Server (pr_input)**: dst=10.0.0.10 == our_ip ✓ → **ACCEPTED**.
+10. **L2 Server (ether_input)**: Destination MAC matches ✓. ether_type=0x0800 → L3.
+11. **L3 Server (pr_input)**: dst=10.0.0.20 == our_ip ✓ → **ACCEPTED**.
 12. **L4 Server (recvFromL4)**: type=ECHO_REPLY → stores in buffer, unlocks mutex ← **Reply received!**
 
 **Key Point**: This example demonstrates the system's ability to **receive** an incoming ICMP ECHO_REQUEST and **automatically respond** with an ECHO_REPLY — exactly as a real operating system responds to a `ping` command.
@@ -368,17 +395,22 @@ Each scenario initializes two `inet_os` instances with complete L2/L3/L4 stacks,
 ## 4. Assumptions, Known Issues, and Notes
 
 ### Assumptions
-- The system runs in Virtual OS mode with two `inet_os` instances in the same process, connected via a virtual cable
+- The system runs in Virtual OS mode with **four** `inet_os` instances in the same process (two per topology), connected via virtual cables
 - ARP tables are pre-populated with static entries (no real ARP resolution over the network)
 - Routing is limited to simple gateway-based routing (no complex routing tables)
 - Only ICMP ECHO_REQUEST and ECHO_REPLY messages are supported (protocol filter in L3)
+- Each virtual NIC has a unique MAC address to enable correct destination MAC filtering
 
 ### Known Issues
-1. **Network Noise**: The pcap sniffer threads capture real traffic from the Wi-Fi adapter (TCP, UDP, ARP broadcasts, etc.). This traffic is correctly dropped by the L3 validation (protocol ≠ ICMP, or destination IP mismatch), but it produces "DROPPED" log messages in the console.
-2. **Duplicate Frames**: In some cases, a frame may be received twice — once from the virtual cable and once from the pcap sniffer. This does not cause an infinite loop because `recvFromL4` only sends ECHO_REPLY in response to ECHO_REQUEST (not in response to another ECHO_REPLY).
-3. **`inet_ntoa` Static Buffer**: The `inet_ntoa` function returns a pointer to a shared static buffer. Multiple calls in the same `<<` chain would overwrite each other. This was resolved by capturing each IP address into a separate `std::string` before printing.
+1. **Duplicate Frames**: A frame may be received twice — once from the virtual cable and once from the pcap sniffer reflection (when the Wi-Fi adapter echoes injected frames back). This does not cause an infinite loop because `recvFromL4` only sends ECHO_REPLY in response to ECHO_REQUEST (not in response to another ECHO_REPLY). The duplicate manifests as an extra round-trip in the console output after the primary transaction completes.
+2. **`inet_ntoa` Static Buffer**: The `inet_ntoa` function returns a pointer to a shared static buffer. Multiple calls in the same `<<` chain would overwrite each other. This was resolved by capturing each IP address into a separate `std::string` before printing.
+3. **Sniffer Thread Lifetime**: The framework's NIC does not support clean shutdown of its internal pcap sniffer thread. To avoid access violations when the program exits, we call `exit(0)` to skip C++ destructors.
 
 ### Design Decisions
-- **Virtual Cable**: Implemented because WinPcap/Npcap on Windows Wi-Fi adapters does not support loopback of injected frames. The virtual cable guarantees delivery between the two virtual NICs.
+- **Persistent Object Architecture**: All NIC/stack objects are created once at program start and persist until exit. This avoids crashes caused by pcap sniffer threads referencing destroyed objects when scenarios were previously implemented as separate functions.
+- **Map-Based Virtual Cable**: Changed from a single global pair (`g_peer_a/g_peer_b`) to a `std::map<L2_impl*, L2_impl*>` to support multiple independent virtual cable pairs (one per topology).
+- **Destination MAC Filter**: Added to `ether_input` to prevent cross-contamination between the external and internal topologies, which share the same physical Wi-Fi pcap adapter.
+- **Silent Drops in L3**: Validation failures (wrong IP version, bad checksum, non-ICMP protocol, etc.) are dropped silently without console output. Diagnostics are only printed for ICMP packets that pass all checks. This eliminates the noise from real Wi-Fi traffic (TCP, UDP, ARP) captured by the pcap sniffer.
 - **`htons` on Output, No `ntohs` on Input**: The framework's `leread` converts `ether_type` to host byte order before calling `ether_input`, so no conversion is needed on input. On output, `htons` is required because `lestart` writes bytes to the wire as-is.
 - **Dual Transmission (lestart + virtual cable)**: `lestart` is called so that Wireshark can capture the frames on the Wi-Fi adapter. The virtual cable ensures the frame is reliably delivered to the peer NIC regardless of pcap loopback behavior.
+- **`exit(0)` on Quit**: Used instead of normal return to avoid destructor-triggered crashes from orphaned sniffer threads.
