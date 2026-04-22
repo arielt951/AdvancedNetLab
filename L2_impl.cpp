@@ -1,5 +1,6 @@
 #include <iomanip>
 #include <string>
+#include <map>
 
 #include "NetlabTAU/include/L3/L3.h"
 #include "NetlabTAU/include/L2/L2.h"
@@ -19,21 +20,21 @@ L2::~L2() { inet.datalink(nullptr); }
 /************************************************************************/
 
 /*
- * Global peer map: when ether_output sends a frame, it also delivers
- * a copy directly to the peer L2_impl's ether_input. This bypasses
- * pcap loopback, which doesn't work on Wi-Fi adapters in Windows.
+ * Peer map: supports multiple virtual cable pairs.
+ * When ether_output sends a frame, it also delivers a copy directly
+ * to the peer L2_impl's ether_input. This bypasses pcap loopback,
+ * which doesn't work on Wi-Fi adapters in Windows.
  */
-static L2_impl* g_peer_a = nullptr;
-static L2_impl* g_peer_b = nullptr;
+static std::map<L2_impl*, L2_impl*> g_peer_map;
 
 void L2_impl_set_peers(L2_impl* a, L2_impl* b) {
-	g_peer_a = a;
-	g_peer_b = b;
+	g_peer_map[a] = b;
+	g_peer_map[b] = a;
 }
 
 static L2_impl* get_peer(L2_impl* self) {
-	if (self == g_peer_a) return g_peer_b;
-	if (self == g_peer_b) return g_peer_a;
+	auto it = g_peer_map.find(self);
+	if (it != g_peer_map.end()) return it->second;
 	return nullptr;
 }
 
@@ -53,14 +54,21 @@ void L2_impl::ether_input(std::shared_ptr<std::vector<byte>> &m, std::vector<byt
 	if (eh->ether_shost == inet.nic()->mac()) {
 		return;
 	}
-	
-	std::cout << "[L2] <-- ether_input captured frame! EtherType: 0x" << std::hex << ether_type << std::dec << std::endl;
+
+	/* Destination MAC filter: only process frames addressed to us or broadcast.
+	 * This prevents cross-contamination when multiple virtual NIC pairs share
+	 * the same physical pcap adapter. */
+	static const mac_addr broadcast_mac("ff:ff:ff:ff:ff:ff");
+	if (eh->ether_dhost != inet.nic()->mac() && eh->ether_dhost != broadcast_mac) {
+		return;
+	}
 
 	/* Demultiplex based on Ethernet type field */
 	switch (ether_type) {
 	case L2::ether_header::ETHERTYPE_IP:
 	{
 		/* IP packet - pass up to L3 (IP layer) */
+		std::cout << "[L2] <-- ether_input captured frame! EtherType: 0x" << std::hex << ether_type << std::dec << std::endl;
 		protosw *ip_proto = inet.inetsw(protosw::SWPROTO_IP);
 		if (ip_proto) {
 			int iphlen = 0;
@@ -77,7 +85,7 @@ void L2_impl::ether_input(std::shared_ptr<std::vector<byte>> &m, std::vector<byt
 		break;
 	}
 	default:
-		/* Unknown ether_type - drop the packet */
+		/* Unknown ether_type - drop the packet silently */
 		break;
 	}
 }

@@ -43,38 +43,25 @@ void L3_impl::pr_input(const struct pr_input_args &args) {
 	
 	/* Extract the IP header - iterator already points past the Ethernet header */
 	ip = reinterpret_cast<struct iphdr*>(&(*it));
-	std::cout << "[L3] <-- pr_input captured frame! Checking ip properties..." << std::endl;
 	
 	/* 1. Validate IP version is 4 */
-	if (ip->ip_v_hl.hb != 4) {
-		std::cout << "[L3]     DROPPED: IP version = " << (int)ip->ip_v_hl.hb << " (expected 4)" << std::endl;
-		return;
-	}
+	if (ip->ip_v_hl.hb != 4) return;
 	
 	/* 2. Validate Header Length (at least 20 bytes) */
 	hlen = ip->ip_v_hl.lb << 2;  
-	if (hlen < sizeof(struct iphdr)) {
-		std::cout << "[L3]     DROPPED: header length = " << hlen << " (min " << sizeof(struct iphdr) << ")" << std::endl;
-		return;
-	}
+	if (hlen < sizeof(struct iphdr)) return;
 	
 	/* 3. Validate Total Length */
-	if (ntohs(ip->ip_len) < hlen) {
-		std::cout << "[L3]     DROPPED: total length " << ntohs(ip->ip_len) << " < hlen " << hlen << std::endl;
-		return;
-	}
+	if (ntohs(ip->ip_len) < hlen) return;
 	
 	/* 4. Checksum verification */
-	if (in_cksum(&(*it), hlen) != 0) {
-		std::cout << "[L3]     DROPPED: bad checksum" << std::endl;
-		return;
-	}
+	if (in_cksum(&(*it), hlen) != 0) return;
 
-	/* 5. Verify the protocol is ICMP */
-	if (ip->ip_p != IPPROTO_ICMP) {
-		std::cout << "[L3]     DROPPED: protocol = " << (int)ip->ip_p << " (not ICMP)" << std::endl;
-		return;
-	}
+	/* 5. Verify the protocol is ICMP — silently drop all other protocols */
+	if (ip->ip_p != IPPROTO_ICMP) return;
+
+	/* === Only ICMP packets reach here — print diagnostics === */
+	std::cout << "[L3] <-- pr_input captured frame! Checking ip properties..." << std::endl;
 
 	/* 6. Verify destination IP matches our NIC's IP or broadcast */
 	std::string src_str = inet_ntoa(ip->ip_src);
