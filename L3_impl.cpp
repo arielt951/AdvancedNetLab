@@ -4,12 +4,29 @@
 
 #include <iomanip>
 #include <algorithm>
+#include <chrono>
+#include <sstream>
 
 #include "NetlabTAU/include/L4/L4.h"
 #include "NetlabTAU/include/L3/L3_impl.h"
 #include <iostream>
 #include "NetlabTAU/include/L2/L2.h"
 #include "NetlabTAU/include/L1/NIC.h"
+
+/* Timestamp helper — returns "[HH:MM:SS.mmm]" */
+static std::string ts() {
+	auto now = std::chrono::system_clock::now();
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+	auto t = std::chrono::system_clock::to_time_t(now);
+	struct tm tm_buf;
+	localtime_s(&tm_buf, &t);
+	std::ostringstream oss;
+	oss << "[" << std::setfill('0') << std::setw(2) << tm_buf.tm_hour
+	    << ":" << std::setw(2) << tm_buf.tm_min
+	    << ":" << std::setw(2) << tm_buf.tm_sec
+	    << "." << std::setw(3) << ms.count() << "] ";
+	return oss.str();
+}
 
 /************************************************************************/
 /*                         L3_impl				                        */
@@ -61,19 +78,19 @@ void L3_impl::pr_input(const struct pr_input_args &args) {
 	if (ip->ip_p != IPPROTO_ICMP) return;
 
 	/* === Only ICMP packets reach here — print diagnostics === */
-	std::cout << "[L3] <-- pr_input captured frame! Checking ip properties..." << std::endl;
+	std::cout << ts() << "[L3] <-- pr_input captured frame! Checking ip properties..." << std::endl;
 
 	/* 6. Verify destination IP matches our NIC's IP or broadcast */
 	std::string src_str = inet_ntoa(ip->ip_src);
 	std::string dst_str = inet_ntoa(ip->ip_dst);
 	std::string our_str = inet_ntoa(inet.nic()->ip_addr());
-	std::cout << "[L3]     src=" << src_str << " dst=" << dst_str 
+	std::cout << ts() << "[L3]     src=" << src_str << " dst=" << dst_str 
 	          << " our_ip=" << our_str << std::endl;
 	if (ip->ip_dst.s_addr != inet.nic()->ip_addr().s_addr && ip->ip_dst.s_addr != 0xFFFFFFFF) {
-		std::cout << "[L3]     DROPPED: destination IP mismatch" << std::endl;
+		std::cout << ts() << "[L3]     DROPPED: destination IP mismatch" << std::endl;
 		return;
 	}
-	std::cout << "[L3]     ACCEPTED! Passing to L4..." << std::endl;
+	std::cout << ts() << "[L3]     ACCEPTED! Passing to L4..." << std::endl;
 
 	/* Advance iterator past the IP header */
 	it += hlen;
@@ -103,7 +120,7 @@ int L3_impl::ip_output(const struct ip_output_args &args) {
 	it = m->begin() + sizeof(L2::ether_header);
 	
 	struct iphdr* ip = reinterpret_cast<struct iphdr*>(&(*it));
-	std::cout << "[L3] --> ip_output initiated. Wrapping IP encapsulation..." << std::endl;
+	std::cout << ts() << "[L3] --> ip_output initiated. Wrapping IP encapsulation..." << std::endl;
 	int hlen = sizeof(struct iphdr);
 
 	/* Fill the IP header fields */
@@ -136,9 +153,9 @@ int L3_impl::ip_output(const struct ip_output_args &args) {
 		if ((target_ip & mask) != (my_ip & mask)) {
 			/* External: next hop is the default gateway */
 			ro_dst_in->sin_addr.s_addr = inet.nic()->dgw_addr().s_addr;
-			std::cout << "[L3]     External target -> routing via gateway" << std::endl;
+			std::cout << ts() << "[L3]     External target -> routing via gateway" << std::endl;
 		} else {
-			std::cout << "[L3]     Internal target -> direct routing" << std::endl;
+			std::cout << ts() << "[L3]     Internal target -> direct routing" << std::endl;
 		}
 	}
 

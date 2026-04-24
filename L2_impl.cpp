@@ -1,11 +1,27 @@
 #include <iomanip>
 #include <string>
-#include <map>
+#include <chrono>
+#include <sstream>
 
 #include "NetlabTAU/include/L3/L3.h"
 #include "NetlabTAU/include/L2/L2.h"
 #include "NetlabTAU/include/L2/L2_ARP.h"
 #include "NetlabTAU/include/L1/NIC.h"
+
+/* Timestamp helper — returns "[HH:MM:SS.mmm]" */
+static std::string ts() {
+	auto now = std::chrono::system_clock::now();
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+	auto t = std::chrono::system_clock::to_time_t(now);
+	struct tm tm_buf;
+	localtime_s(&tm_buf, &t);
+	std::ostringstream oss;
+	oss << "[" << std::setfill('0') << std::setw(2) << tm_buf.tm_hour
+	    << ":" << std::setw(2) << tm_buf.tm_min
+	    << ":" << std::setw(2) << tm_buf.tm_sec
+	    << "." << std::setw(3) << ms.count() << "] ";
+	return oss.str();
+}
 
 /************************************************************************/
 /*                         L2			                                */
@@ -14,29 +30,6 @@
 L2::L2(class inet_os &inet) : inet(inet) { inet.datalink(this); }
 
 L2::~L2() { inet.datalink(nullptr); }
-
-/************************************************************************/
-/*                   Virtual Cable (peer routing)                       */
-/************************************************************************/
-
-/*
- * Peer map: supports multiple virtual cable pairs.
- * When ether_output sends a frame, it also delivers a copy directly
- * to the peer L2_impl's ether_input. This bypasses pcap loopback,
- * which doesn't work on Wi-Fi adapters in Windows.
- */
-static std::map<L2_impl*, L2_impl*> g_peer_map;
-
-void L2_impl_set_peers(L2_impl* a, L2_impl* b) {
-	g_peer_map[a] = b;
-	g_peer_map[b] = a;
-}
-
-static L2_impl* get_peer(L2_impl* self) {
-	auto it = g_peer_map.find(self);
-	if (it != g_peer_map.end()) return it->second;
-	return nullptr;
-}
 
 /************************************************************************/
 /*                         L2_impl		                                */
@@ -55,20 +48,11 @@ void L2_impl::ether_input(std::shared_ptr<std::vector<byte>> &m, std::vector<byt
 		return;
 	}
 
-	/* Destination MAC filter: only process frames addressed to us or broadcast.
-	 * This prevents cross-contamination when multiple virtual NIC pairs share
-	 * the same physical pcap adapter. */
-	static const mac_addr broadcast_mac("ff:ff:ff:ff:ff:ff");
-	if (eh->ether_dhost != inet.nic()->mac() && eh->ether_dhost != broadcast_mac) {
-		return;
-	}
-
 	/* Demultiplex based on Ethernet type field */
 	switch (ether_type) {
 	case L2::ether_header::ETHERTYPE_IP:
 	{
 		/* IP packet - pass up to L3 (IP layer) */
-		std::cout << "[L2] <-- ether_input captured frame! EtherType: 0x" << std::hex << ether_type << std::dec << std::endl;
 		protosw *ip_proto = inet.inetsw(protosw::SWPROTO_IP);
 		if (ip_proto) {
 			int iphlen = 0;
@@ -95,7 +79,7 @@ void L2_impl::ether_output(std::shared_ptr<std::vector<byte>> &m, std::vector<by
 	L2::ether_header *eh;
 	mac_addr desten;       /* destination MAC address */
 	u_short ether_type = 0;
-	std::cout << "[L2] --> ether_output initiated. Routing frame down to NIC..." << std::endl;
+	std::cout << ts() << "[L2] --> ether_output initiated. Routing frame down to NIC..." << std::endl;
 	//Extractions of the fields according to the packet type (IP or ARP) and the address family in dst
 	if (dst->sa_family == AF_INET) {
 		/* Normal IP packet - resolve destination IP to MAC via ARP */
@@ -132,26 +116,6 @@ void L2_impl::ether_output(std::shared_ptr<std::vector<byte>> &m, std::vector<by
 		it = m->begin(); /* Re-assign iterator invalidated by resize */
 	}
 
-	/* Always send via L1/NIC so Wireshark can capture the frame */
+	/* Send via L1/NIC — frame goes onto the real network adapter */
 	inet.nic()->lestart(m, it);
-
-	/* Virtual cable: also deliver directly to the peer's ether_input.
-	 * This ensures reliable delivery even when pcap loopback doesn't work. */
-	L2_impl* peer = get_peer(this);
-	if (peer) {
-		/* Make a copy of the frame for the peer */
-		auto m_copy = std::make_shared<std::vector<byte>>(*m);
-		auto it_copy = m_copy->begin();
-
-		/* The ether_header in the copy has ether_type in WIRE (network) byte order.
-		 * The framework's leread normally converts to host byte order before calling ether_input.
-		 * We must do the same conversion here. */
-		L2::ether_header* eh_copy = reinterpret_cast<L2::ether_header*>(&(*it_copy));
-		eh_copy->ether_type = ntohs(eh_copy->ether_type);
-
-		/* Advance iterator past the Ethernet header (this is what leread does) */
-		it_copy += sizeof(L2::ether_header);
-
-		peer->ether_input(m_copy, it_copy, eh_copy);
-	}
 }

@@ -4,6 +4,9 @@
 
 #include <bitset>
 #include <iostream>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
 
 #include "NetlabTAU/include/L4/L4.h"
 #include "NetlabTAU/include/L3/L3_impl.h"
@@ -16,6 +19,21 @@
 /* Collapse namespaces */
 using namespace std;
 using namespace netlab;
+
+/* Timestamp helper — returns "[HH:MM:SS.mmm]" */
+static std::string ts() {
+	auto now = std::chrono::system_clock::now();
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+	auto t = std::chrono::system_clock::to_time_t(now);
+	struct tm tm_buf;
+	localtime_s(&tm_buf, &t);
+	std::ostringstream oss;
+	oss << "[" << std::setfill('0') << std::setw(2) << tm_buf.tm_hour
+	    << ":" << std::setw(2) << tm_buf.tm_min
+	    << ":" << std::setw(2) << tm_buf.tm_sec
+	    << "." << std::setw(3) << ms.count() << "] ";
+	return oss.str();
+}
 
 /************************************************************************/
 /*                         L4_ICMP_impl				                    */
@@ -36,7 +54,7 @@ L3* L4::getNetworkLayer() { return reinterpret_cast<L3*>(inet.inetsw(protosw::SW
 int L4::sendToL4(byte *sendData, size_t sendDataLen, std::string destIP, std::string srcIP, Tins::ICMP::Flags flag)
 {
 	try {
-		std::cout << "[L4] --> sendToL4 initiated! Constructing ICMP payload for IP: " << destIP << std::endl;
+		std::cout << ts() << "[L4] --> sendToL4 initiated! Constructing ICMP payload for IP: " << destIP << std::endl;
 		// 1. Build the ICMP segment with libtins
 		Tins::ICMP icmp(flag); 
 		Tins::RawPDU payload(sendData, sendDataLen);
@@ -79,13 +97,13 @@ int L4::sendToL4(byte *sendData, size_t sendDataLen, std::string destIP, std::st
 int L4::recvFromL4(byte* sendData, size_t sendDataLen, std::string destIP)
 {	
 	try {
-		std::cout << "[L4] <-- recvFromL4 unwrapping packet!" << std::endl;
+		std::cout << ts() << "[L4] <-- recvFromL4 unwrapping packet!" << std::endl;
 		// 1. Unwrap ICMP packet 
 		Tins::ICMP icmp(sendData, sendDataLen);
 
 		// 2. Validate Type (It must be an ECHO request or ECHO reply)
 		if (icmp.type() != Tins::ICMP::ECHO_REPLY && icmp.type() != Tins::ICMP::ECHO_REQUEST) {
-			std::cout << "[L4]     Packet is not target ECHO class (dropped)." << std::endl;
+			std::cout << ts() << "[L4]     Packet is not target ECHO class (dropped)." << std::endl;
 			return 0; // Drop irrelevant traffic
 		}
 
@@ -104,7 +122,7 @@ int L4::recvFromL4(byte* sendData, size_t sendDataLen, std::string destIP)
 			std::copy(payload.begin(), payload.end(), recvPacket);
 
 			if (icmp.type() == Tins::ICMP::ECHO_REQUEST) {
-				std::cout << "[L4]     Captured ECHO_REQUEST! Sending ECHO_REPLY back to " << destIP << "..." << std::endl;
+				std::cout << ts() << "[L4]     Captured ECHO_REQUEST! Sending ECHO_REPLY back to " << destIP << "..." << std::endl;
 				sendToL4(recvPacket, recvPacketLen, destIP, "", Tins::ICMP::ECHO_REPLY);
 			}
 
